@@ -104,11 +104,11 @@ def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int,
     is_deepseek_shape = head_dim == 192 and head_dim_v == 128
     is_standard_range = 8 <= head_dim <= 128 and 8 <= head_dim_v <= 128
 
-    is_sm90_range = 8 <= head_dim <= 256 and 8 <= head_dim_v <= 256
+    is_sm90_range = 8 <= head_dim <= 512 and 8 <= head_dim_v <= 512
     if compute_capability == 9:
         assert is_sm90_range and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
             f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported on SM90. "
-            f"head_dim and head_dim_v must be between 8 and 256 and divisible by {alignment}."
+            f"head_dim and head_dim_v must be between 8 and 512 and divisible by {alignment}."
         )
     elif compute_capability in [10, 11]:
         assert (is_standard_range or is_deepseek_shape) and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
@@ -155,9 +155,12 @@ def _tile_size_fwd_sm90(head_dim, head_dim_v, is_causal, is_local, sparse_block_
     elif head_dim <= 192:
         tile_n = 96 if is_local else (128 if head_dim_v <= 128 else 112)
         return FwdConfig(128, tile_n, True, True)
-    else:  # hdim 256
+    elif head_dim <= 256:
         tile_n = 64 if is_local else 80
         return FwdConfig(128, tile_n, True, True)
+    else:  # hdim > 256 (e.g. 512), uses multi-pass V-chunking at dispatch level
+        # tile_m=64 keeps O accumulator in registers; tile_n=64 with 2 stages fits smem
+        return FwdConfig(64, 64, True, True)
 
 @dataclass(frozen=True)
 class BwdConfig:
@@ -424,6 +427,57 @@ def _flash_attn_fwd(
         softmax_scale = 1.0 / math.sqrt(head_dim)
     if softcap == 0.0:
         softcap = None
+
+    # Multi-pass V-chunking for large head_dim_v on SM90.
+    # When head_dim_v exceeds what fits in a single pass (register/smem limits),
+    # we split V along head_dim_v into chunks and run the kernel once per chunk.
+    # Each pass recomputes Q@K^T and softmax (identical across chunks since they
+    # don't depend on V), then computes P @ V_chunk for that slice of head_dim_v.
+    # Chunk at 128 to stay within SM90 register budget (255 regs/thread) and smem
+    # (228 KB). For head_dim > 256, smem for Q+K is so large that head_dim_v > 128
+    # doesn't fit with 2 pipeline stages. For any head_dim, head_dim_v > 256 would
+    # push the O accumulator beyond the register file.
+    _HDV_CHUNK_SIZE = 128
+    _needs_hdv_chunking = arch // 10 == 9 and (
+        head_dim_v > 256 or (head_dim > 256 and head_dim_v > _HDV_CHUNK_SIZE)
+    )
+    if _needs_hdv_chunking:
+        hdv_chunk = _HDV_CHUNK_SIZE
+        out_torch_dtype = q.dtype
+        device = q.device
+        q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
+        if out is None:
+            out = torch.empty(
+                *q_batch_seqlen_shape, num_head, head_dim_v, dtype=out_torch_dtype, device=device
+            )
+        lse_out = lse
+        for chunk_start in range(0, head_dim_v, hdv_chunk):
+            chunk_end = min(chunk_start + hdv_chunk, head_dim_v)
+            v_chunk = v[..., chunk_start:chunk_end].contiguous()
+            out_chunk, lse_chunk = _flash_attn_fwd(
+                q, k, v_chunk,
+                cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+                seqused_q=seqused_q, seqused_k=seqused_k,
+                max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+                page_table=page_table,
+                softmax_scale=softmax_scale, causal=causal, softcap=softcap,
+                window_size_left=window_size_left, window_size_right=window_size_right,
+                learnable_sink=learnable_sink,
+                tile_mn=tile_mn, mma_pv_is_rs=mma_pv_is_rs,
+                intra_wg_overlap=intra_wg_overlap,
+                num_threads=num_threads, num_splits=num_splits,
+                pack_gqa=pack_gqa, _arch=arch,
+                score_mod=score_mod, mask_mod=mask_mod,
+                block_sparse_tensors=block_sparse_tensors,
+                return_lse=return_lse,
+                out=None, lse=lse_out,
+                aux_tensors=aux_tensors,
+            )
+            out[..., chunk_start:chunk_end].copy_(out_chunk)
+            if lse_out is None:
+                lse_out = lse_chunk
+        return out, lse_out
+
     qhead_per_kvhead = num_head // num_head_kv
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
@@ -1015,6 +1069,11 @@ def _flash_attn_bwd(
 
     num_head, head_dim = q.shape[-2:]
     head_dim_v = v.shape[-1]
+
+    assert head_dim <= 256 and head_dim_v <= 256, (
+        f"Backward pass does not support head_dim={head_dim} or head_dim_v={head_dim_v} > 256. "
+        "head_dim > 256 is currently forward-only on SM90 (via multi-pass V-chunking)."
+    )
 
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right
