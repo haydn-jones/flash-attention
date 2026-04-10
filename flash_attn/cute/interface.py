@@ -111,9 +111,10 @@ def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int,
             f"head_dim and head_dim_v must be between 8 and 512 and divisible by {alignment}."
         )
     elif compute_capability in [10, 11]:
-        assert (is_standard_range or is_deepseek_shape) and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
+        is_sm100_range = 8 <= head_dim <= 512 and 8 <= head_dim_v <= 512
+        assert (is_sm100_range or is_deepseek_shape) and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
             f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported on SM100/SM110. "
-            f"head_dim and head_dim_v must be between 8 and 128 and divisible by {alignment}, or (192, 128) for DeepSeek."
+            f"head_dim and head_dim_v must be between 8 and 512 and divisible by {alignment}, or (192, 128) for DeepSeek."
         )
 
 
@@ -428,18 +429,27 @@ def _flash_attn_fwd(
     if softcap == 0.0:
         softcap = None
 
-    # Multi-pass V-chunking for large head_dim_v on SM90.
-    # When head_dim_v exceeds what fits in a single pass (register/smem limits),
-    # we split V along head_dim_v into chunks and run the kernel once per chunk.
+    # Multi-pass V-chunking for large head_dim_v.
+    # When head_dim_v exceeds what fits in a single kernel pass (register/smem/TMEM
+    # limits), we split V along head_dim_v into chunks and run the kernel per chunk.
     # Each pass recomputes Q@K^T and softmax (identical across chunks since they
     # don't depend on V), then computes P @ V_chunk for that slice of head_dim_v.
-    # Chunk at 128 to stay within SM90 register budget (255 regs/thread) and smem
-    # (228 KB). For head_dim > 256, smem for Q+K is so large that head_dim_v > 128
-    # doesn't fit with 2 pipeline stages. For any head_dim, head_dim_v > 256 would
-    # push the O accumulator beyond the register file.
+    #
+    # SM90: chunk at 128 to stay within register budget (255 regs/thread) and smem
+    #   (228 KB). For head_dim > 256, smem for Q+K is so large that head_dim_v > 128
+    #   doesn't fit. For any head_dim, head_dim_v > 256 overflows registers.
+    # SM100/SM110: chunk at 128 to stay within TMEM budget (512 cols). The O
+    #   accumulator lives in TMEM and at head_dim_v > 128 with head_dim > 128 the
+    #   TMEM layout (S0 + S1 + O stages) exceeds 512 columns.
     _HDV_CHUNK_SIZE = 128
-    _needs_hdv_chunking = arch // 10 == 9 and (
-        head_dim_v > 256 or (head_dim > 256 and head_dim_v > _HDV_CHUNK_SIZE)
+    _arch_family = arch // 10
+    _needs_hdv_chunking = (
+        (_arch_family == 9 and (
+            head_dim_v > 256 or (head_dim > 256 and head_dim_v > _HDV_CHUNK_SIZE)
+        ))
+        or (_arch_family in [10, 11] and (
+            head_dim_v > 256 or (head_dim > 128 and head_dim_v > _HDV_CHUNK_SIZE)
+        ))
     )
     if _needs_hdv_chunking:
         hdv_chunk = _HDV_CHUNK_SIZE
@@ -532,6 +542,16 @@ def _flash_attn_fwd(
                 fwd_cfg = FwdConfig(128, 64, True, True)
         elif arch // 10 == 8:
             fwd_cfg = FwdConfig(128, 64, True, True)  # SM80, should tune
+        elif arch // 10 in [10, 11]:
+            # SM100/SM110: default 128x128 works for head_dim ≤ 128.
+            # Larger head_dim needs smaller tiles to fit smem (228 KB) and TMEM (512 cols).
+            if head_dim <= 128:
+                fwd_cfg = FwdConfig(128, 128, True, True)
+            elif head_dim <= 256:
+                fwd_cfg = FwdConfig(128, 64, True, True)
+            else:  # head_dim > 256 (e.g. 512), V-chunked to 128 by multi-pass above
+                # m=64, n=64, q_stage=1 gives smem ≈ 208 KB with 2 KV pipeline stages
+                fwd_cfg = FwdConfig(64, 64, True, True)
         elif arch // 10 == 9:
             sparse_q = get_sparse_q_block_size(block_sparse_tensors, seqlen_q)
             fwd_cfg = _tile_size_fwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q=sparse_q)
@@ -552,8 +572,12 @@ def _flash_attn_fwd(
     if max_seqlen_k is None:
         max_seqlen_k = seqlen_k
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
-    if arch // 10 == 10:
+    if arch // 10 in [10, 11]:
         q_stage = 2 if seqlen_q_packgqa > tile_m else 1
+        # Large head_dim needs q_stage=1 to fit smem: q_stage=2 doubles Q buffer
+        # (2 * 64 * 512 * 2 = 128 KB for Q alone, leaving only 1 KV stage).
+        if head_dim > 256:
+            q_stage = 1
     else:
         q_stage = 1
 
@@ -1019,6 +1043,143 @@ def _bwd_postprocess_convert(
 _bwd_postprocess_convert.compile_cache = get_jit_cache("bwd_post")
 
 
+def _flash_attn_bwd_tiled(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    softmax_scale: float,
+    causal: bool = False,
+    window_size_left: Optional[int] = None,
+    window_size_right: Optional[int] = None,
+    dq: Optional[torch.Tensor] = None,
+    dk: Optional[torch.Tensor] = None,
+    dv: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Memory-efficient tiled backward for large head_dim (> 256).
+
+    Uses PyTorch matmuls tiled over Q/K sequence blocks to avoid materializing
+    the full attention matrix. Slower than fused kernels but supports arbitrary
+    head_dim and beats naive eager (which materializes the full N×N attention).
+
+    Tiles along both seqlen_q and seqlen_k for O(tile_q * tile_k) peak memory
+    per tile rather than O(seqlen_q * seqlen_k).
+    """
+    B, Sq, H, D = q.shape
+    Sk, Hk, Dv = k.shape[1], k.shape[2], v.shape[-1]
+    G = H // Hk  # GQA group size
+
+    TILE_Q = 64
+    TILE_K = 64
+
+    # Permute to head-first layouts for efficient matmul.
+    # Q/dO: (B, S, H, D) -> (B, Hk, G, S, D) for GQA-aware computation
+    # K/V:  (B, S, Hk, D) -> (B, Hk, S, D)
+    q_g = q.float().reshape(B, Sq, Hk, G, D).permute(0, 2, 3, 1, 4)
+    k_f = k.float().permute(0, 2, 1, 3)
+    v_f = v.float().permute(0, 2, 1, 3)
+    dout_g = dout.float().reshape(B, Sq, Hk, G, Dv).permute(0, 2, 3, 1, 4)
+
+    # LSE: (B, H, Sq) -> (B, Hk, G, Sq)
+    lse_g = lse.reshape(B, Hk, G, Sq)
+
+    # delta = rowsum(dout * out), precomputed for softmax backward.
+    # (B, Sq, H) -> (B, Hk, G, Sq)
+    delta = (dout.float() * out.float()).sum(-1)
+    delta_g = delta.reshape(B, Sq, Hk, G).permute(0, 2, 3, 1)
+
+    # Accumulate gradients in float32
+    dq_g = torch.zeros_like(q_g)
+    dk_f = torch.zeros_like(k_f)
+    dv_f = torch.zeros_like(v_f)
+
+    is_local = window_size_left is not None or window_size_right is not None
+    wsl = window_size_left if window_size_left is not None else Sk
+    wsr = window_size_right if window_size_right is not None else Sk
+
+    for j0 in range(0, Sk, TILE_K):
+        j1 = min(j0 + TILE_K, Sk)
+        kj = k_f[:, :, j0:j1]
+        vj = v_f[:, :, j0:j1]
+
+        dk_acc = torch.zeros(B, Hk, j1 - j0, D, dtype=torch.float32, device=q.device)
+        dv_acc = torch.zeros(B, Hk, j1 - j0, Dv, dtype=torch.float32, device=q.device)
+
+        for i0 in range(0, Sq, TILE_Q):
+            i1 = min(i0 + TILE_Q, Sq)
+
+            # Skip tiles that are entirely masked out
+            if causal and j0 >= i1:
+                continue
+            if is_local:
+                # Q positions [i0, i1), K positions [j0, j1)
+                # A Q at position i attends to K in [i - wsl, i + wsr]
+                if j0 > (i1 - 1) + wsr:
+                    continue
+                if j1 - 1 < i0 - wsl:
+                    continue
+
+            qi = q_g[:, :, :, i0:i1]
+            doi = dout_g[:, :, :, i0:i1]
+            lsei = lse_g[:, :, :, i0:i1]
+            di = delta_g[:, :, :, i0:i1]
+
+            # S = Q @ K^T * scale: (B, Hk, G, tile_q, tile_k)
+            s = torch.einsum('bhgid,bhkd->bhgik', qi, kj) * softmax_scale
+
+            # Apply masks
+            q_pos = torch.arange(i0, i1, device=q.device)
+            k_pos = torch.arange(j0, j1, device=q.device)
+            if causal:
+                causal_mask = k_pos[None, None, None, None, :] > q_pos[None, None, None, :, None]
+                s = s.masked_fill(causal_mask, float('-inf'))
+            if is_local:
+                local_mask = (
+                    (k_pos[None, None, None, None, :] > q_pos[None, None, None, :, None] + wsr)
+                    | (k_pos[None, None, None, None, :] < q_pos[None, None, None, :, None] - wsl)
+                )
+                s = s.masked_fill(local_mask, float('-inf'))
+
+            # P = exp(S - LSE): (B, Hk, G, tile_q, tile_k)
+            p = torch.exp(s - lsei.unsqueeze(-1))
+
+            # dP = dO @ V^T: (B, Hk, G, tile_q, tile_k)
+            dp = torch.einsum('bhgid,bhkd->bhgik', doi, vj)
+
+            # dS = P * (dP - delta): softmax backward
+            ds = p * (dp - di.unsqueeze(-1))
+
+            # Accumulate gradients (einsum sums over G for dK/dV)
+            dv_acc += torch.einsum('bhgik,bhgid->bhkd', p, doi)
+            dk_acc += torch.einsum('bhgik,bhgid->bhkd', ds, qi) * softmax_scale
+            dq_g[:, :, :, i0:i1] += torch.einsum('bhgik,bhkd->bhgid', ds, kj) * softmax_scale
+
+        dk_f[:, :, j0:j1] += dk_acc
+        dv_f[:, :, j0:j1] += dv_acc
+
+    # Convert back to (B, S, H, D) layout and target dtype
+    dq_out = dq_g.permute(0, 3, 1, 2, 4).reshape(B, Sq, H, D)
+    dk_out = dk_f.permute(0, 2, 1, 3)
+    dv_out = dv_f.permute(0, 2, 1, 3)
+
+    if dq is not None:
+        dq.copy_(dq_out.to(dq.dtype))
+    else:
+        dq = dq_out.to(q.dtype)
+    if dk is not None:
+        dk.copy_(dk_out.to(dk.dtype))
+    else:
+        dk = dk_out.to(k.dtype)
+    if dv is not None:
+        dv.copy_(dv_out.to(dv.dtype))
+    else:
+        dv = dv_out.to(v.dtype)
+
+    return dq, dk, dv
+
+
 def _flash_attn_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1070,14 +1231,50 @@ def _flash_attn_bwd(
     num_head, head_dim = q.shape[-2:]
     head_dim_v = v.shape[-1]
 
-    assert head_dim <= 256 and head_dim_v <= 256, (
-        f"Backward pass does not support head_dim={head_dim} or head_dim_v={head_dim_v} > 256. "
-        "head_dim > 256 is currently forward-only on SM90 (via multi-pass V-chunking)."
-    )
-
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right
     )
+
+    # Determine whether fused backward kernels can handle this head_dim.
+    # SM90:  backward supports head_dim ≤ 256.
+    # SM100: backward supports head_dim ≤ 128 (or special case (192, 128) with 2CTA).
+    # For larger dims, fall back to a tiled PyTorch backward that uses matmuls
+    # over Q/K sequence blocks to avoid materializing the full attention matrix.
+    _arch_family = arch // 10
+    _sm100_bwd_ok = (head_dim <= 128 and head_dim_v <= 128) or (head_dim == 192 and head_dim_v == 128)
+    _needs_tiled_bwd = (
+        head_dim > 256 or head_dim_v > 256  # exceeds all fused kernel limits
+        or (_arch_family in [10, 11] and not _sm100_bwd_ok)  # SM100 kernel head_dim limits
+    )
+    if _needs_tiled_bwd:
+        assert q.dim() == 4, (
+            f"Tiled backward for head_dim={head_dim}/head_dim_v={head_dim_v} > 256 "
+            "does not support varlen inputs (cu_seqlens_q/cu_seqlens_k)."
+        )
+        assert softcap == 0.0 or softcap is None, (
+            f"Tiled backward for head_dim > 256 does not support softcap={softcap}."
+        )
+        assert score_mod is None and mask_mod is None, (
+            "Tiled backward for head_dim > 256 does not support score_mod/mask_mod."
+        )
+        assert block_sparse_tensors is None, (
+            "Tiled backward for head_dim > 256 does not support block sparsity."
+        )
+        if softmax_scale is None:
+            softmax_scale = 1.0 / math.sqrt(head_dim)
+        if dq is None:
+            dq = torch.empty_like(q)
+        if dk is None:
+            dk = torch.empty_like(k)
+        if dv is None:
+            dv = torch.empty_like(v)
+        return _flash_attn_bwd_tiled(
+            q, k, v, out, dout, lse, softmax_scale,
+            causal=causal,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            dq=dq, dk=dk, dv=dv,
+        )
 
     if arch // 10 == 12:
         # SM120: uses SM80 MMA with 99 KB SMEM, 128 threads (4 warps).
